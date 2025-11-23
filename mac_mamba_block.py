@@ -2,8 +2,14 @@
 import os
 import numpy as np
 import Metal
+import hashlib
+import pickle
+import pathlib
 
 class MambaBlockMetal:
+    # Class-level library cache - shared across all instances
+    _library_cache = {}
+    
     def __init__(
         self,
         d_model=768,
@@ -11,7 +17,7 @@ class MambaBlockMetal:
         headdim=64,
         d_state=128,
         ngroups=8,
-        d_conv=4,
+        d_conv=4, 
         rmsnorm=True,
         metal_path="src/metal/mamba_ssm_full.metal"
     ):
@@ -27,23 +33,21 @@ class MambaBlockMetal:
         assert self.nheads % ngroups == 0
 
         self.device = Metal.MTLCreateSystemDefaultDevice()
-        print(f"[MambaBlockMetal] Using device: {self.device.name()}")
-        print(f"[MambaBlockMetal] d_model={d_model}, d_inner={self.d_inner}, nheads={self.nheads}, ngroups={ngroups}")
+        
+        # Only print device info once (for first instance)
+        if not MambaBlockMetal._library_cache:
+            print(f"[MambaBlockMetal] Using device: {self.device.name()}")
+            print(f"[MambaBlockMetal] d_model={d_model}, d_inner={self.d_inner}, nheads={self.nheads}, ngroups={ngroups}")
 
-        # Compile Metal
-        with open(os.path.abspath(metal_path)) as f:
-            source = f.read()
-        opts = Metal.MTLCompileOptions.new()
-        library, err = self.device.newLibraryWithSource_options_error_(source, opts, None)
-        if err: raise RuntimeError(err.localizedDescription())
-        self.library = library
+        # Compile Metal with caching (class-level cache for sharing)
+        self.library = self._get_or_compile_library(metal_path)
         self.queue = self.device.newCommandQueue()
 
         # Pipelines
         self.pipes = {}
         for name in ["rms_norm_kernel", "linear_proj_kernel", "conv1d_causal_kernel",
                      "ssm_scan_kernel", "gating_kernel", "selective_scan_update_kernel"]:
-            fn = library.newFunctionWithName_(name)
+            fn = self.library.newFunctionWithName_(name)
             pipe, err = self.device.newComputePipelineStateWithFunction_error_(fn, None)
             if err: raise RuntimeError(err.localizedDescription())
             self.pipes[name] = pipe
@@ -52,6 +56,31 @@ class MambaBlockMetal:
         
         # Inference cache
         self.inference_cache = None
+    
+    def _get_or_compile_library(self, metal_path):
+        """Compile Metal library with class-level caching to share across instances."""
+        abs_path = os.path.abspath(metal_path)
+        
+        # Check class-level cache first
+        if abs_path in MambaBlockMetal._library_cache:
+            return MambaBlockMetal._library_cache[abs_path]
+        
+        # Read source
+        with open(abs_path) as f:
+            source = f.read()
+        
+        # Compile from source
+        print(f"[MambaBlockMetal] Compiling Metal library (this may take a few seconds)...")
+        opts = Metal.MTLCompileOptions.new()
+        library, err = self.device.newLibraryWithSource_options_error_(source, opts, None)
+        if err:
+            raise RuntimeError(err.localizedDescription())
+        
+        # Store in class-level cache
+        MambaBlockMetal._library_cache[abs_path] = library
+        print(f"[MambaBlockMetal] Metal library compiled and cached")
+        
+        return library
 
     def _init_weights(self):
         Di = self.d_inner
@@ -196,6 +225,7 @@ class MambaBlockMetal:
     def allocate_inference_cache(self, batch_size):
         """
         Pre-allocate GPU buffers for inference to avoid re-allocation overhead.
+        Creates persistent numpy views to eliminate memcpy overhead.
         """
         B = batch_size
         H, E, N, G = self.nheads, self.headdim, self.d_state, self.ngroups
@@ -214,48 +244,68 @@ class MambaBlockMetal:
             "dt_bias": None # We handle bias in python or kernel? Kernel has dt_bias input.
         }
         
+        # Create persistent numpy views for zero-copy access
+        self.inference_cache["x_view"] = np.frombuffer(
+            self.inference_cache["x"].contents().as_buffer(self.inference_cache["x"].length()), 
+            dtype='f4'
+        ).reshape(B, H, E)
+        
+        self.inference_cache["dt_view"] = np.frombuffer(
+            self.inference_cache["dt"].contents().as_buffer(self.inference_cache["dt"].length()), 
+            dtype='f4'
+        ).reshape(B, H, E)
+        
+        self.inference_cache["B_view"] = np.frombuffer(
+            self.inference_cache["B"].contents().as_buffer(self.inference_cache["B"].length()), 
+            dtype='f4'
+        ).reshape(B, G, N)
+        
+        self.inference_cache["C_view"] = np.frombuffer(
+            self.inference_cache["C"].contents().as_buffer(self.inference_cache["C"].length()), 
+            dtype='f4'
+        ).reshape(B, G, N)
+        
+        self.inference_cache["z_view"] = np.frombuffer(
+            self.inference_cache["z"].contents().as_buffer(self.inference_cache["z"].length()), 
+            dtype='f4'
+        ).reshape(B, H, E)
+        
+        self.inference_cache["out_view"] = np.frombuffer(
+            self.inference_cache["out"].contents().as_buffer(self.inference_cache["out"].length()), 
+            dtype='f4'
+        ).reshape(B, H, E)
+        
         # Initialize state to zeros
-        ptr = self.inference_cache["state"].contents()
-        np_ptr = np.frombuffer(ptr.as_buffer(self.inference_cache["state"].length()), dtype='f4')
-        np_ptr[:] = 0
+        state_view = np.frombuffer(
+            self.inference_cache["state"].contents().as_buffer(self.inference_cache["state"].length()), 
+            dtype='f4'
+        )
+        state_view[:] = 0
 
     def step_inference(self, x_np, dt_np, B_np, C_np, z_np=None, dt_softplus=True):
         """
-        Fast inference step using pre-allocated buffers.
-        Does NOT wait for completion.
-        Returns the output buffer.
+        Fast inference step using pre-allocated buffers with zero-copy writes.
+        Does NOT wait for completion - returns immediately after dispatching.
+        Returns the output buffer view.
         """
         if self.inference_cache is None:
             raise RuntimeError("Inference cache not initialized. Call allocate_inference_cache first.")
             
         cache = self.inference_cache
+        
+        # Zero-copy writes using persistent views - direct memory assignment
+        cache["x_view"][:] = x_np
+        cache["dt_view"][:] = dt_np
+        cache["B_view"][:] = B_np
+        cache["C_view"][:] = C_np
+        
+        if z_np is not None:
+            cache["z_view"][:] = z_np
+            
         B, H, E = x_np.shape
         N = self.d_state
         G = self.ngroups
         
-        # Copy inputs to GPU buffers
-        # This is still a sync copy (CPU->Shared Buffer), but avoids allocation
-        # x
-        ptr = cache["x"].contents()
-        np.frombuffer(ptr.as_buffer(cache["x"].length()), dtype='f4')[:] = x_np.flatten()
-        
-        # dt
-        ptr = cache["dt"].contents()
-        np.frombuffer(ptr.as_buffer(cache["dt"].length()), dtype='f4')[:] = dt_np.flatten()
-        
-        # B
-        ptr = cache["B"].contents()
-        np.frombuffer(ptr.as_buffer(cache["B"].length()), dtype='f4')[:] = B_np.flatten()
-        
-        # C
-        ptr = cache["C"].contents()
-        np.frombuffer(ptr.as_buffer(cache["C"].length()), dtype='f4')[:] = C_np.flatten()
-        
-        # z
-        if z_np is not None:
-            ptr = cache["z"].contents()
-            np.frombuffer(ptr.as_buffer(cache["z"].length()), dtype='f4')[:] = z_np.flatten()
-            
         cmd = self.queue.commandBuffer()
         enc = cmd.computeCommandEncoder()
         enc.setComputePipelineState_(self.pipes["selective_scan_update_kernel"])
@@ -281,7 +331,10 @@ class MambaBlockMetal:
         enc.endEncoding()
         
         cmd.commit()
-        # NO waitUntilCompleted()
+        # NO waitUntilCompleted() - async execution
+        
+        # Store command buffer for optional explicit sync
+        self._last_cmd = cmd
         
         return cache["out"]
 

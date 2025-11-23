@@ -1,226 +1,264 @@
+#!/usr/bin/env python
 """
-Inference script for Mamba2 with Metal acceleration.
-
-This script loads the pretrained state-spaces/mamba2-130m model and runs
-text generation using the Metal-accelerated backend.
+Run Mamba2 inference with Metal acceleration.
 """
 
 import argparse
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
-from mamba2_metal import Mamba2Metal
+import time
+import psutil
+import os
+import numpy as np
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoConfig
+from mamba2_metal import Mamba2ModelMetal
 
-class Mamba2ModelMetal:
-    """Wrapper for Mamba2 model with Metal acceleration."""
-    
+class InferenceParams:
+    """Inference parameters for caching."""
+    def __init__(self, max_seqlen, batch_size):
+        self.max_seqlen = max_seqlen
+        self.max_batch_size = batch_size
+        self.seqlen_offset = 0
+        self.key_value_memory_dict = {}
+
+class Mamba2Inference:
     def __init__(self, model_name="state-spaces/mamba2-130m", device="cpu"):
         """
         Initialize Mamba2 model with Metal acceleration.
-        
-        Args:
-            model_name: HuggingFace model name (used for config reference mostly)
-            device: Device to use (cpu/cuda/mps)
         """
-
+        self.process = psutil.Process(os.getpid())
         self.device = device
+        self.model_name = model_name
         
-        # --- 修改 1: 直接使用 GPTNeoXTokenizer ---
-        print(f"Loading GPTNeoXTokenizer (EleutherAI/gpt-neox-20b) directly...")
+        print(f"Loading tokenizer from {model_name}...")
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "EleutherAI/gpt-neox-20b",
-                trust_remote_code=True
-            )
-        except Exception as e:
-            print(f"❌ Error loading GPTNeoXTokenizer: {e}")
-            raise e
-        
-        # Set pad token if not set
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        except:
+            print("Fallback to GPT-NeoX tokenizer")
+            self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+            
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        print(f"✓ Tokenizer loaded (vocab_size: {len(self.tokenizer)})")
-        
-        print(f"Loading Mamba2 model with Metal acceleration...")
-        
-        # 由於你的環境似乎無法直接載入 pretrained model，這裡保留你原本的 "From Scratch" 測試邏輯
-        # 並依據 SimpleConfig 初始化
-        print("Creating model from scratch using SimpleMambaLM...")
-        
-        class SimpleMambaLM(nn.Module):
-            def __init__(self, config):
-                super().__init__()
-                # 1. 增加 Embedding 層：把 (B, L) 轉成 (B, L, D)
-                self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-                # 2. 這是原本的 Mamba 層
-                self.backbone = Mamba2Metal(
-                    d_model=config.d_model,
-                    d_state=128,
-                    d_conv=4,
-                    expand=2,
-                    headdim=64,
-                    ngroups=8,
-                )
-                # 3. 增加輸出層：把 (B, L, D) 轉回 (B, L, V)
-                self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-            
-            def forward(self, input_ids):
-                x = self.embedding(input_ids) # 變成 3 維
-                x = self.backbone(x)
-                logits = self.lm_head(x)
-                return logits
 
-        # 設定 Config
-        class SimpleConfig:
-            vocab_size = 50280 # GPT-NeoX vocab size
-            d_model = 768
-            n_layer = 1
+        print(f"Loading config from {model_name}...")
+        self.config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         
-        self.config = SimpleConfig()
+        print(f"Initializing Mamba2Metal model...")
+        self.model = Mamba2ModelMetal(self.config, device=device)
         
-        # 初始化這個包含 Embedding 的完整模型
-        self.model = SimpleMambaLM(self.config)
-        self.model.to(device) # 記得移動到 device
+        print(f"Loading weights...")
+        self.model.load_hf_weights(model_name)
+        self.model.to(device)
+        self.model.eval()
         
-        print(f"✓ Model loaded successfully (From Scratch Test Mode)")
+        print("✓ Model loaded successfully")
 
-    def _convert_to_metal(self, model):
-        """Placeholder for layer replacement."""
-        return model
-    
-    def generate(self, prompt, max_length=50, temperature=1.0, top_k=50):
+    def _get_memory_mb(self):
+        return self.process.memory_info().rss / 1024 / 1024
+
+    def sample_token(self, logits, temperature=1.0, top_k=50, top_p=0.9):
         """
-        Generate text from a prompt.
+        Sample a token from logits using Temperature, Top-K, and Top-P.
         """
-        print(f"\nTokenizing prompt...")
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.device)
+        # logits: (1, vocab_size)
+        logits = logits[0, -1, :] # Take last token's logits
         
-        print(f"Input tokens: {input_ids.shape[1]}")
-        print(f"Generating up to {max_length} tokens...")
+        # Apply temperature
+        if temperature > 0:
+            logits = logits / temperature
         
-        # --- 修改 2: 直接使用自定義的 _simple_generate 推論 ---
-        # 移除 hasattr(self.model, 'generate') 的檢查，強制跑你的迴圈
-        print("Using custom greedy generation loop...")
-        output_ids = self._simple_generate(input_ids, max_length)
+        # Convert to probabilities
+        probs = F.softmax(logits, dim=-1)
         
-        # Decode output
-        output_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return output_text
+        # Top-K filtering
+        if top_k > 0:
+            top_k = min(top_k, probs.size(-1))  # Safety check
+            indices_to_remove = probs < torch.topk(probs, top_k)[0][..., -1, None]
+            probs[indices_to_remove] = 0
+            probs = probs / probs.sum() # Re-normalize
 
+        # Top-P (Nucleus) filtering
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            probs[indices_to_remove] = 0
+            probs = probs / probs.sum() # Re-normalize
+            
+        # Sample
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_prob = probs[next_token] # Keep as tensor to avoid sync
+        
+        return next_token.unsqueeze(0), token_prob
 
-    def _simple_generate(self, input_ids, max_length):
+    def generate(self, prompt, max_length=50, temperature=0.7, top_k=50, top_p=0.95, memory_limit_gb=8.0, benchmark=False):
         """
-        Basic greedy generation loop for raw PyTorch models.
+        Generate text with observation mode.
         """
-        generated = input_ids
-        for i in range(max_length):
-            # 取得模型輸出
-            logits = self.model(generated)
-            # 取最後一個 token 的 logits (B, L, V) -> (B, V)
-            last_token_logits = logits[:, -1, :]
+        print("\n" + "=" * 60)
+        print(f"🚀 GENERATION START")
+        print(f"Config: Temp={temperature}, TopK={top_k}, TopP={top_p}, MemLimit={memory_limit_gb}GB, Benchmark={benchmark}")
+        print("=" * 60)
+        
+        start_mem = self._get_memory_mb() / 1024
+        print(f"Initial Memory: {start_mem:.2f} GB")
+        
+        print(f"Tokenizing prompt...")
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        batch_size, seqlen = input_ids.shape
+        
+        print(f"Input tokens: {seqlen}")
+        
+        # Initialize inference params
+        inference_params = InferenceParams(max_seqlen=max_length + seqlen, batch_size=batch_size)
+        
+        t0 = time.perf_counter()
+        
+        # Prefill
+        with torch.no_grad():
+            logits = self.model(input_ids, inference_params=inference_params)
+            inference_params.seqlen_offset += seqlen
             
-            # Greedy search: 取機率最大的
-            next_token = torch.argmax(last_token_logits, dim=-1).unsqueeze(-1)
+            # Sample first token
+            t_start = time.perf_counter()
+            next_token, prob = self.sample_token(logits, temperature, top_k, top_p)
+            t_end = time.perf_counter()
             
-            # 串接
-            generated = torch.cat([generated, next_token], dim=1)
+            latencies = [t_end - t_start]
             
-            # 簡單進度顯示
-            if i % 10 == 0:
-                print(f".", end="", flush=True)
-
-            # 檢查是否是 EOS
-            if self.tokenizer.eos_token_id and next_token.item() == self.tokenizer.eos_token_id:
-                break
+            generated = [input_ids]
+            generated.append(next_token)
+            
+            nll_sum = 0.0
+            prob_sum = 0.0
+            
+            if not benchmark:
+                nll_sum = -np.log(prob.item() + 1e-10)
+                prob_sum = prob.item()
+                print(f"Prompt processed. Starting generation...")
+                print("-" * 60)
+                print(f"{prompt}", end="", flush=True)
+                print(self.tokenizer.decode(next_token[0]), end="", flush=True)
+            else:
+                print(f"Prompt processed. Starting benchmark generation (no output)...")
+            
+            gen_count = 0
+            
+            # Generation loop
+            for _ in range(max_length):
+                if not benchmark:
+                    curr_mem = self._get_memory_mb() / 1024
+                    if curr_mem > memory_limit_gb:
+                        print(f"\n🛑 EMERGENCY STOP: Memory > {memory_limit_gb} GB")
+                        break
                 
-        print() # Newline after dots
-        return generated
-    
+                
+                t_step_start = time.perf_counter()
+                
+                # Forward pass for single token
+                logits = self.model(next_token, inference_params=inference_params)
+                inference_params.seqlen_offset += 1
+                
+                # Sample
+                next_token, prob = self.sample_token(logits, temperature, top_k, top_p)
+                
+                if not benchmark:
+                    # Syncs with CPU
+                    t_step_end = time.perf_counter()
+                    latencies.append(t_step_end - t_step_start)
+                    
+                    nll_sum += -np.log(prob.item() + 1e-10)
+                    prob_sum += prob.item()
+                    
+                    token_str = self.tokenizer.decode(next_token[0])
+                    print(token_str, end="", flush=True)
+                    
+                    if next_token.item() == self.tokenizer.eos_token_id:
+                        break
+                else:
+                    # Benchmark mode: minimal overhead
+                    # We still need to check EOS if we want fair comparison, but .item() is a sync.
+                    # For pure throughput, we might skip EOS check or do it periodically.
+                    # Here we skip EOS check to measure raw GPU speed.
+                    pass
+                
+                generated.append(next_token)
+                gen_count += 1
+        
+        # Ensure GPU is done
+        if self.device == "mps":
+            torch.mps.synchronize()
+        elif self.device == "cuda":
+            torch.cuda.synchronize()
+            
+        t1 = time.perf_counter()
+        total_time = t1 - t0
+        total_tokens = gen_count + 1
+        
+        print("\n" + "=" * 60)
+        
+        # Statistics
+        final_mem = self._get_memory_mb() / 1024
+        throughput = total_tokens / total_time if total_time > 0 else 0
+        
+        print(f"📊 FINAL STATISTICS")
+        print(f"Model           : {self.model_name}")
+        print(f"Config          : Temp={temperature}, TopK={top_k}, TopP={top_p}")
+        print(f"Total Time      : {total_time:.2f}s")
+        print(f"Throughput      : {throughput:.2f} tokens/s")
+        
+        if not benchmark:
+            ppl = np.exp(nll_sum / total_tokens)
+            avg_latency = np.mean(latencies) * 1000
+            latency_std = np.std(latencies) * 1000
+            avg_conf = prob_sum / total_tokens
+            print(f"Avg Latency     : {avg_latency:.2f} ms/token (±{latency_std:.2f} ms)")
+            print(f"Generation PPL  : {ppl:.4f} (Lower is better)")
+            print(f"Avg Confidence  : {avg_conf:.4f} (Higher is better)")
+        else:
+            print(f"Avg Latency     : {(total_time / total_tokens * 1000):.2f} ms/token (Amortized)")
+            
+        print(f"Final Memory    : {final_mem:.2f} GB")
+        print("=" * 60)
+        
+        full_ids = torch.cat(generated, dim=1)
+        return self.tokenizer.decode(full_ids[0], skip_special_tokens=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Run Mamba2 Inference with Metal Acceleration")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="state-spaces/mamba2-130m",
-        help="HuggingFace model name (ignored for tokenizer now)"
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default="Mamba is a type of",
-        help="Input prompt for generation"
-    )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=50,
-        help="Maximum number of tokens to generate"
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Sampling temperature (Not used in greedy search currently)"
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=50,
-        help="Top-k sampling parameter (Not used in greedy search currently)"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        choices=["cpu", "cuda", "mps"],
-        help="Device to use"
-    )
+    parser.add_argument("--model", type=str, default="state-spaces/mamba2-130m", help="HuggingFace model name")
+    parser.add_argument("--prompt", type=str, default="Mamba is a type of", help="Input prompt")
+    parser.add_argument("--max_length", type=int, default=50, help="Maximum number of tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-K sampling")
+    parser.add_argument("--top_p", type=float, default=0.95, help="Top-P sampling")
+    parser.add_argument("--device", type=str, default="cpu", help="Device to run on (cpu/cuda/mps)")
+    parser.add_argument("--benchmark", action="store_true", help="Run in benchmark mode (no output, no sync)")
     
     args = parser.parse_args()
     
-    print("=" * 60)
-    print("Mamba2 Metal Inference")
-    print("=" * 60)
-    
-    # Initialize model
-    print(f"\n{'=' * 60}")
-    print(f"Prompt: {args.model}")
-    print("=" * 60)
     try:
-        model = Mamba2ModelMetal(model_name=args.model, device=args.device)
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # Generate text
-    print(f"\n{'=' * 60}")
-    print(f"Prompt: {args.prompt}")
-    print("=" * 60)
-    
-    try:
+        model = Mamba2Inference(model_name=args.model, device=args.device)
         output = model.generate(
             args.prompt,
             max_length=args.max_length,
             temperature=args.temperature,
-            top_k=args.top_k
+            top_k=args.top_k,
+            top_p=args.top_p,
+            benchmark=args.benchmark
         )
-        
-        print(f"\n{'=' * 60}")
-        print("Generated Output:")
-        print("=" * 60)
-        print(output)
-        print()
-        
     except Exception as e:
-        print(f"❌ Error during generation: {e}")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()

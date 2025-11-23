@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Optional
+import os
+from huggingface_hub import hf_hub_download
 
 # Import Metal operations
 try:
@@ -24,6 +26,7 @@ try:
         mamba_split_conv1d_scan_combined,
         METAL_AVAILABLE,
     )
+    from metal_ops.rmsnorm_metal import RMSNormGated
 except ImportError:
     print("[Mamba2Metal] Warning: metal_ops not available, falling back to CPU")
     METAL_AVAILABLE = False
@@ -41,6 +44,47 @@ except ImportError:
     # Fallback if huggingface_hub not available
     class PyTorchModelHubMixin:
         pass
+
+
+class RMSNormGated(nn.Module):
+    """
+    Pure PyTorch implementation of RMSNorm with optional gating.
+    Efficient on MPS (Metal) without custom kernels.
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        norm_before_gate: bool = False,
+        group_size: Optional[int] = None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.norm_before_gate = norm_before_gate
+        self.group_size = group_size
+        
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Gating first if not norm_before_gate
+        if z is not None and not self.norm_before_gate:
+            x = x * F.silu(z)
+            
+        # RMSNorm
+        dtype = x.dtype
+        x_f = x.float()
+        variance = x_f.pow(2).mean(-1, keepdim=True)
+        x_f = x_f * torch.rsqrt(variance + self.eps)
+        out = x_f.to(dtype) * self.weight
+        
+        # Gating after if norm_before_gate
+        if z is not None and self.norm_before_gate:
+            out = out * F.silu(z)
+            
+        return out
 
 
 class Mamba2Metal(nn.Module, PyTorchModelHubMixin):
@@ -284,7 +328,7 @@ class Mamba2Metal(nn.Module, PyTorchModelHubMixin):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                     seq_idx=seq_idx,
-                ).transpose(1, 2)
+                )
             
             # Split xBC
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
@@ -384,42 +428,31 @@ class Mamba2Metal(nn.Module, PyTorchModelHubMixin):
                 self.activation,
             )
         
-        # Split
+        # Split xBC
         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-        A = -torch.exp(self.A_log.float())
         
-        # SSM step
-        if selective_state_update is None:
-            # CPU fallback
-            assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
-            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
-            dA = torch.exp(dt * A)
-            x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-            ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-            y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-            y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-            y = rearrange(y, "b h p -> b (h p)")
-            if not self.rmsnorm:
-                y = y * self.act(z)
-        else:
-            # Metal accelerated
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-            dt = repeat(dt, "b h -> b h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            if not self.rmsnorm:
-                z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
-            y = selective_state_update(
-                ssm_state, x_reshaped, dt, A, B, C, D,
-                z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias,
-                dt_softplus=True
-            )
-            y = rearrange(y, "b h p -> b (h p)")
+        # SSM step - Pure PyTorch (MPS accelerated)
+        # This avoids the massive CPU-GPU roundtrip of the custom Metal kernels
+        A = -torch.exp(self.A_log.float())
+        assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
+        
+        dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
+        dA = torch.exp(dt * A)
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        
+        # Discretize x
+        dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+        
+        # Update state
+        ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        
+        # Output
+        y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+        y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+        y = rearrange(y, "b h p -> b (h p)")
+        
+        if not self.rmsnorm:
+            y = y * self.act(z)
         
         # Normalization
         if self.rmsnorm:
@@ -479,3 +512,150 @@ class Mamba2Metal(nn.Module, PyTorchModelHubMixin):
 
 # Add missing import
 import inspect
+
+
+class Mamba2Block(nn.Module):
+    def __init__(self, config, layer_idx, device=None, dtype=None):
+        super().__init__()
+        # Use RMSNormGated (no bias, no centering) instead of LayerNorm
+        self.norm = RMSNormGated(config.d_model, eps=1e-5, device=device, dtype=dtype)
+        self.mixer = Mamba2Metal(
+            d_model=config.d_model,
+            d_state=getattr(config, "d_state", 128),
+            d_conv=getattr(config, "d_conv", 4),
+            expand=getattr(config, "expand", 2),
+            headdim=getattr(config, "headdim", 64),
+            ngroups=getattr(config, "ngroups", 1),
+            layer_idx=layer_idx,
+            device=device,
+            dtype=dtype,
+        )
+    
+    def forward(self, x, inference_params=None):
+        residual = x
+        x = self.norm(x)
+        x = self.mixer(x, inference_params=inference_params)
+        return residual + x
+
+class Mamba2ModelMetal(nn.Module, PyTorchModelHubMixin):
+    """
+    Full Mamba2 Model with Metal acceleration.
+    Includes Embeddings, Layers (Mamba2Metal blocks), Norm, and LM Head.
+    """
+    def __init__(self, config, device=None, dtype=None):
+        super().__init__()
+        self.config = config
+        self.d_model = config.d_model
+        self.vocab_size = config.vocab_size
+        self.n_layer = config.n_layer
+        self.device = device
+        self.dtype = dtype
+        
+        # Embeddings
+        self.embedding = nn.Embedding(self.vocab_size, self.d_model, device=device, dtype=dtype)
+        
+        # Layers
+        self.layers = nn.ModuleList([
+            Mamba2Block(config, i, device=device, dtype=dtype)
+            for i in range(self.n_layer)
+        ])
+            
+        # Final Norm
+        self.norm_f = RMSNormGated(self.d_model, eps=1e-5, device=device, dtype=dtype)
+        
+        # LM Head
+        self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False, device=device, dtype=dtype)
+        
+        # Tie weights if needed
+        if getattr(config, "tie_word_embeddings", True):
+            self.lm_head.weight = self.embedding.weight
+
+    def forward(self, input_ids, inference_params=None):
+        # input_ids: (B, L)
+        x = self.embedding(input_ids)
+        
+        for layer in self.layers:
+            x = layer(x, inference_params=inference_params)
+            
+        x = self.norm_f(x)
+        logits = self.lm_head(x)
+        return logits
+        
+    def load_hf_weights(self, model_name_or_path):
+        """Load weights from local path or HuggingFace repo."""
+
+        print(f"Loading weights from {model_name_or_path}...")
+
+        state_dict = None
+
+        # -------- 1️⃣ 本地模型 --------
+        if os.path.isdir(model_name_or_path):
+            safetensors_path = os.path.join(model_name_or_path, "model.safetensors")
+            bin_path = os.path.join(model_name_or_path, "pytorch_model.bin")
+
+            if os.path.exists(safetensors_path):
+                state_dict = load_file(safetensors_path)
+            elif os.path.exists(bin_path):
+                state_dict = torch.load(bin_path, map_location="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"No weights found in {model_name_or_path}. "
+                    "Expecting model.safetensors or pytorch_model.bin"
+                )
+
+        # -------- 2️⃣ HuggingFace Hub --------
+        else:
+            try:
+                # 優先 safetensors
+                file_path = hf_hub_download(repo_id=model_name_or_path, filename="model.safetensors")
+                state_dict = load_file(file_path)
+            except Exception:
+                # fallback bin
+                file_path = hf_hub_download(repo_id=model_name_or_path, filename="pytorch_model.bin")
+                state_dict = torch.load(file_path, map_location="cpu")
+
+        # -------- 3️⃣ Vocab size mismatch --------
+        if "lm_head.weight" in state_dict:
+            hf_vocab_size = state_dict["lm_head.weight"].shape[0]
+            if hf_vocab_size != self.vocab_size:
+                print(f"Vocab size mismatch: config={self.vocab_size}, weights={hf_vocab_size}. Resizing...")
+                self.vocab_size = hf_vocab_size
+                self.embedding = nn.Embedding(self.vocab_size, self.d_model, device=self.device, dtype=self.dtype)
+                self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False, device=self.device, dtype=self.dtype)
+                if getattr(self.config, "tie_word_embeddings", True):
+                    self.lm_head.weight.data = self.embedding.weight.data
+
+        # -------- 4️⃣ Map weights --------
+        my_sd = self.state_dict()
+        mapped_sd = {}
+
+        for k, v in state_dict.items():
+            new_k = k
+            # Adjust keys
+            if k.startswith("backbone.embeddings."):
+                new_k = k.replace("backbone.embeddings.", "embedding.")
+            elif k.startswith("backbone.embedding."):
+                new_k = k.replace("backbone.embedding.", "embedding.")
+            elif k.startswith("backbone.layers."):
+                new_k = k.replace("backbone.layers.", "layers.")
+            elif k.startswith("backbone.norm_f."):
+                new_k = k.replace("backbone.norm_f.", "norm_f.")
+
+            if new_k in my_sd:
+                if my_sd[new_k].shape == v.shape:
+                    mapped_sd[new_k] = v
+                else:
+                    print(f"[WARN] Shape mismatch for {new_k}: expected {my_sd[new_k].shape}, got {v.shape}. Skipping.")
+            else:
+                # 可以印 info 幫 debug
+                print(f"[INFO] Key {new_k} not found in model state dict. Skipping.")
+
+        # -------- 5️⃣ Load --------
+        missing, unexpected = self.load_state_dict(mapped_sd, strict=False)
+        real_missing = [k for k in missing if not k.endswith(".bias")]
+
+        print(f"Weights loaded. Missing: {len(real_missing)} (excluding biases), Unexpected: {len(unexpected)}")
+        if real_missing:
+            print(f"Missing keys: {real_missing}")
+        if unexpected:
+            print(f"Unexpected keys: {unexpected}")
