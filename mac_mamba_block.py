@@ -1,4 +1,4 @@
-# mac_mamba_block.py  ← 最終可運行版
+# mac_mamba_block.py  ← 更新版，新增 selective_state_update 支援單步前向傳播加速
 import os
 import numpy as np
 import Metal
@@ -42,13 +42,16 @@ class MambaBlockMetal:
         # Pipelines
         self.pipes = {}
         for name in ["rms_norm_kernel", "linear_proj_kernel", "conv1d_causal_kernel",
-                     "ssm_scan_kernel", "gating_kernel"]:
+                     "ssm_scan_kernel", "gating_kernel", "selective_scan_update_kernel"]:
             fn = library.newFunctionWithName_(name)
             pipe, err = self.device.newComputePipelineStateWithFunction_error_(fn, None)
             if err: raise RuntimeError(err.localizedDescription())
             self.pipes[name] = pipe
 
         self._init_weights()
+        
+        # Inference cache
+        self.inference_cache = None
 
     def _init_weights(self):
         Di = self.d_inner
@@ -190,10 +193,166 @@ class MambaBlockMetal:
         result = np.frombuffer(out_buf.contents().as_buffer(out_buf.length()), np.float32)
         return result.reshape(B, L, self.d_model).copy() + x_np
 
+    def allocate_inference_cache(self, batch_size):
+        """
+        Pre-allocate GPU buffers for inference to avoid re-allocation overhead.
+        """
+        B = batch_size
+        H, E, N, G = self.nheads, self.headdim, self.d_state, self.ngroups
+        
+        self.inference_cache = {
+            "state": self.device.newBufferWithLength_options_(B*H*E*N*4, Metal.MTLResourceStorageModeShared),
+            "x": self.device.newBufferWithLength_options_(B*H*E*4, Metal.MTLResourceStorageModeShared),
+            "dt": self.device.newBufferWithLength_options_(B*H*E*4, Metal.MTLResourceStorageModeShared),
+            "B": self.device.newBufferWithLength_options_(B*G*N*4, Metal.MTLResourceStorageModeShared),
+            "C": self.device.newBufferWithLength_options_(B*G*N*4, Metal.MTLResourceStorageModeShared),
+            "z": self.device.newBufferWithLength_options_(B*H*E*4, Metal.MTLResourceStorageModeShared),
+            "out": self.device.newBufferWithLength_options_(B*H*E*4, Metal.MTLResourceStorageModeShared),
+            # Pre-load constant weights
+            "A_log": self._buf(self.A_log),
+            "D": self._buf(self.D),
+            "dt_bias": None # We handle bias in python or kernel? Kernel has dt_bias input.
+        }
+        
+        # Initialize state to zeros
+        ptr = self.inference_cache["state"].contents()
+        np_ptr = np.frombuffer(ptr.as_buffer(self.inference_cache["state"].length()), dtype='f4')
+        np_ptr[:] = 0
+
+    def step_inference(self, x_np, dt_np, B_np, C_np, z_np=None, dt_softplus=True):
+        """
+        Fast inference step using pre-allocated buffers.
+        Does NOT wait for completion.
+        Returns the output buffer.
+        """
+        if self.inference_cache is None:
+            raise RuntimeError("Inference cache not initialized. Call allocate_inference_cache first.")
+            
+        cache = self.inference_cache
+        B, H, E = x_np.shape
+        N = self.d_state
+        G = self.ngroups
+        
+        # Copy inputs to GPU buffers
+        # This is still a sync copy (CPU->Shared Buffer), but avoids allocation
+        # x
+        ptr = cache["x"].contents()
+        np.frombuffer(ptr.as_buffer(cache["x"].length()), dtype='f4')[:] = x_np.flatten()
+        
+        # dt
+        ptr = cache["dt"].contents()
+        np.frombuffer(ptr.as_buffer(cache["dt"].length()), dtype='f4')[:] = dt_np.flatten()
+        
+        # B
+        ptr = cache["B"].contents()
+        np.frombuffer(ptr.as_buffer(cache["B"].length()), dtype='f4')[:] = B_np.flatten()
+        
+        # C
+        ptr = cache["C"].contents()
+        np.frombuffer(ptr.as_buffer(cache["C"].length()), dtype='f4')[:] = C_np.flatten()
+        
+        # z
+        if z_np is not None:
+            ptr = cache["z"].contents()
+            np.frombuffer(ptr.as_buffer(cache["z"].length()), dtype='f4')[:] = z_np.flatten()
+            
+        cmd = self.queue.commandBuffer()
+        enc = cmd.computeCommandEncoder()
+        enc.setComputePipelineState_(self.pipes["selective_scan_update_kernel"])
+        
+        # Set buffers
+        enc.setBuffer_offset_atIndex_(cache["state"], 0, 0)
+        enc.setBuffer_offset_atIndex_(cache["x"], 0, 1)
+        enc.setBuffer_offset_atIndex_(cache["dt"], 0, 2)
+        enc.setBuffer_offset_atIndex_(None, 0, 3) # dt_bias (assumed baked in or handled)
+        enc.setBuffer_offset_atIndex_(cache["A_log"], 0, 4)
+        enc.setBuffer_offset_atIndex_(cache["B"], 0, 5)
+        enc.setBuffer_offset_atIndex_(cache["C"], 0, 6)
+        enc.setBuffer_offset_atIndex_(cache["D"], 0, 7)
+        enc.setBuffer_offset_atIndex_(cache["z"] if z_np is not None else None, 0, 8)
+        enc.setBuffer_offset_atIndex_(cache["out"], 0, 9)
+        
+        # Set constants
+        for i, val in enumerate([B, H, E, N, G, dt_softplus, False], 10):
+            enc.setBytes_length_atIndex_(np.uint32(val).tobytes(), 4, i)
+            
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(
+            Metal.MTLSizeMake(E, H, B), Metal.MTLSizeMake(8, 8, 1))
+        enc.endEncoding()
+        
+        cmd.commit()
+        # NO waitUntilCompleted()
+        
+        return cache["out"]
+
+    def selective_state_update(self, state_np, x_np, dt_np, B_np, C_np, z_np=None, dt_bias_np=None, dt_softplus=True):
+        """
+        Legacy slow method for reference or testing.
+        """
+        B, H, E = x_np.shape
+        N = state_np.shape[3]
+        G = self.ngroups
+        
+        state = self._buf(state_np)
+        x = self._buf(x_np)
+        dt = self._buf(dt_np)
+        dt_bias = self._buf(dt_bias_np)
+        A_log = self._buf(self.A_log)
+        B_proj = self._buf(B_np)
+        C_proj = self._buf(C_np)
+        D = self._buf(self.D)
+        z = self._buf(z_np)
+        out_buf = self.device.newBufferWithLength_options_(B * H * E * 4, Metal.MTLResourceStorageModeShared)
+
+        cmd = self.queue.commandBuffer()
+        enc = cmd.computeCommandEncoder()
+        enc.setComputePipelineState_(self.pipes["selective_scan_update_kernel"])
+        for i, buf in enumerate([state, x, dt, dt_bias, A_log, B_proj, C_proj, D, z, out_buf]):
+            enc.setBuffer_offset_atIndex_(buf, 0, i)
+        for i, val in enumerate([B, H, E, N, G, dt_softplus, False], 10):
+            enc.setBytes_length_atIndex_(np.uint32(val).tobytes(), 4, i)
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(
+            Metal.MTLSizeMake(E, H, B), Metal.MTLSizeMake(8, 8, 1))
+        enc.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        result = np.frombuffer(out_buf.contents().as_buffer(out_buf.length()), np.float32)
+        new_state = np.frombuffer(state.contents().as_buffer(state.length()), np.float32)
+        return result.reshape(B, H, E).copy(), new_state.reshape(B, H, E, N).copy()
+
 # ================ TEST ================
 if __name__ == "__main__":
     block = MambaBlockMetal()
     x = np.random.randn(2, 1024, 768).astype('f4')
     y = block.forward(x)
     print("FINAL SUCCESS! Output shape:", y.shape)
-    print("Output sample:", y[0,0,:5])
+    
+    # Test Fast Inference
+    print("\nTesting Fast Inference...")
+    block.allocate_inference_cache(batch_size=2)
+    
+    B, H, E, N, G = 2, block.nheads, block.headdim, block.d_state, block.ngroups
+    x_step = np.random.randn(B, H, E).astype('f4')
+    dt_step = np.random.randn(B, H, E).astype('f4')
+    B_step = np.random.randn(B, G, N).astype('f4')
+    C_step = np.random.randn(B, G, N).astype('f4')
+    z_step = np.random.randn(B, H, E).astype('f4')
+    
+    out_buf = block.step_inference(x_step, dt_step, B_step, C_step, z_step)
+    
+    # Wait for result just for testing
+    block.queue.commandBuffer().waitUntilCompleted() # Wait for previous commands? No, need to wait on the specific command buffer.
+    # But step_inference doesn't return the command buffer.
+    # In real usage we don't wait.
+    # To check result, we can just read the buffer (it might be stale if we don't wait, but for test we can wait on device)
+    
+    # Hack to wait: submit empty command buffer and wait
+    cmd = block.queue.commandBuffer()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    
+    result = np.frombuffer(out_buf.contents().as_buffer(out_buf.length()), dtype='f4')
+    print("Fast Inference Output shape:", result.shape)
+    print("Output sample:", result[:5])

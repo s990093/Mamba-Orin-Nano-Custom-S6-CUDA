@@ -1,4 +1,4 @@
-// mamba_ssm_full.metal   ← 最終穩定版（支援 macOS 12+ 全系列）
+// mamba_ssm_full.metal   ← 更新版，新增 selective_scan_update_kernel（支援單步狀態更新加速）
 #include <metal_stdlib>
 using namespace metal;
 
@@ -18,6 +18,12 @@ inline float fast_sigmoid(float x) {
 // SiLU = x * sigmoid(x)
 inline float silu(float x) {
     return x * fast_sigmoid(x);
+}
+
+// softplus
+inline float softplus_metal(float x) {
+    if (x > 20.0f) return x;
+    return log(1.0f + exp(x));
 }
 
 // ====================== 1. RMSNorm ======================
@@ -105,11 +111,6 @@ kernel void conv1d_causal_kernel(
 // ====================== 4. SSM Scan ======================
 #define MAX_STATE 128
 
-inline float softplus_metal(float x) {
-    if (x > 20.0f) return x;
-    return log(1.0f + exp(x));
-}
-
 kernel void ssm_scan_kernel(
     device float* state          [[buffer(0)]],
     device const float* x        [[buffer(1)]],
@@ -152,7 +153,7 @@ kernel void ssm_scan_kernel(
 
         float y_l = 0.0f;
         for (uint n = 0; n < N; ++n) {
-            float dA = exp(A_log[A_base + n] * dt_val);
+            float dA = exp(-exp(A_log[A_base + n]) * dt_val);
             float dB = B_proj[(b * L + l) * G * N + group_idx * N + n] * dt_val;
             float h_new = h_cur[n] * dA + dB * x_val;
             h_cur[n] = h_new;
@@ -174,4 +175,71 @@ kernel void gating_kernel(
 ) {
     float zv = z[id];
     out[id] = y[id] * silu(zv);
+}
+
+// ====================== 6. Selective Scan Update (單步更新) ======================
+kernel void selective_scan_update_kernel(
+    device float* state          [[buffer(0)]],  // B H E N
+    device const float* x        [[buffer(1)]],  // B H E
+    device const float* dt       [[buffer(2)]],  // B H E
+    device const float* dt_bias  [[buffer(3)]],  // H E or nullptr
+    device const float* A_log    [[buffer(4)]],  // H E N
+    device const float* B_proj   [[buffer(5)]],  // B G N
+    device const float* C_proj   [[buffer(6)]],  // B G N
+    device const float* D        [[buffer(7)]],  // H E or nullptr
+    device const float* z        [[buffer(8)]],  // B H E or nullptr
+    device float* out            [[buffer(9)]],  // B H E
+
+    constant uint& B             [[buffer(10)]],
+    constant uint& H             [[buffer(11)]],
+    constant uint& E             [[buffer(12)]],
+    constant uint& N             [[buffer(13)]],
+    constant uint& G             [[buffer(14)]],
+    constant bool& dt_softplus   [[buffer(15)]],
+    constant bool& tie_hdim      [[buffer(16)]],
+
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint e = gid.x;
+    uint h = gid.y;
+    uint b = gid.z;
+    if (e >= E || h >= H || b >= B) return;
+
+    uint group_idx = h / (H / G);
+    uint state_base = (b * H + h) * E * N + e * N;
+    uint A_base = h * E * N + e * N;
+
+    float h_cur[MAX_STATE];
+    for (uint n = 0; n < N; ++n) h_cur[n] = state[state_base + n];
+
+    uint idx = (b * H + h) * E + e;
+    float x_val = x[idx];
+    float dt_val = dt[idx];
+    if (dt_bias != nullptr) dt_val += dt_bias[h * E + e];
+    if (dt_softplus) dt_val = softplus_metal(dt_val);
+
+    float y = 0.0f;
+
+    // 假設 !tie_hdim (標準 Mamba 情況)
+    for (uint n = 0; n < N; ++n) {
+        float A_val = A_log[A_base + n];
+        float dA = exp(-exp(A_val) * dt_val);
+        float B_val = B_proj[b * G * N + group_idx * N + n];
+        float dB = B_val * dt_val;
+        float h_new = h_cur[n] * dA + dB * x_val;
+        h_cur[n] = h_new;
+        float C_val = C_proj[b * G * N + group_idx * N + n];
+        y += h_new * C_val;
+    }
+
+    if (D != nullptr) y += x_val * D[h * E + e];
+
+    if (z != nullptr) {
+        float z_val = z[idx];
+        y *= silu(z_val);
+    }
+
+    out[idx] = y;
+
+    for (uint n = 0; n < N; ++n) state[state_base + n] = h_cur[n];
 }
