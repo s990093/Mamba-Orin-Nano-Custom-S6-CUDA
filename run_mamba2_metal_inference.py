@@ -242,11 +242,47 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95, help="Top-P sampling")
     parser.add_argument("--device", type=str, default="cpu", help="Device to run on (cpu/cuda/mps)")
     parser.add_argument("--benchmark", action="store_true", help="Run in benchmark mode (no output, no sync)")
+    parser.add_argument("--use_metal_engine", action="store_true", help="Use pure Metal Engine for inference")
     
     args = parser.parse_args()
     
     try:
         model = Mamba2Inference(model_name=args.model, device=args.device)
+        
+        if args.use_metal_engine:
+            if args.device != "mps":
+                print("Warning: --use_metal_engine requires --device mps. Switching to mps.")
+                args.device = "mps"
+            
+            from metal_ops.mamba_engine import MambaEngine
+            print("🚀 Switching to Pure Metal Engine...")
+            engine = MambaEngine(model.model, device="mps")
+            
+            # Store the original model for prefill
+            original_mamba2_model = model.model
+
+            # Define a wrapper
+            class MetalEngineWrapper:
+                def __init__(self, engine, original_model):
+                    self.engine = engine
+                    self.original_model = original_model # Store the original PyTorch model
+                    
+                def __call__(self, input_ids, inference_params=None):
+                    # input_ids: (B, L)
+                    # If L > 1, it's prefill. Engine currently only supports step (L=1).
+                    # For prefill, we might need to fallback or implement prefill in engine.
+                    # For now, let's assume prefill is done by PyTorch model, and we switch to engine for decoding.
+                    
+                    if input_ids.shape[1] > 1:
+                        # Prefill: use the original PyTorch model
+                        return self.original_model(input_ids, inference_params)
+                    else:
+                        # Decoding step: use the Metal Engine
+                        return self.engine.step(input_ids)
+            
+            # Replace model.model with the wrapper
+            model.model = MetalEngineWrapper(engine, original_mamba2_model)
+            
         output = model.generate(
             args.prompt,
             max_length=args.max_length,

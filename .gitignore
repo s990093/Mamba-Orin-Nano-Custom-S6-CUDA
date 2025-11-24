@@ -8,3 +8,7 @@ ex/
 
 mamba/
 model/
+
+
+*.metallib
+*.metallib.lock

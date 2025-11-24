@@ -3,7 +3,7 @@
 # -----------------------------
 
 # 本地模型路徑
-MODEL_PATH=model/mamba2-780m
+MODEL_PATH=state-spaces/mamba-130m
 
 # Prompt
 PROMPT="Mamba is a sleek, shadowy creature that moves with unparalleled grace and precision, embodying both silent menace and elegant beauty, its presence commanding the attention of all who dare cross its path."

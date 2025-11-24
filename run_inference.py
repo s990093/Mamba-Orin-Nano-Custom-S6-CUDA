@@ -420,8 +420,8 @@ class MambaMonitorMetal:
 if __name__ == "__main__":
     # 注意: 如果你有本地模型，請修改路徑，否則會嘗試從 HF 下載
  
-    # model_path = "model/mamba-1.4b"
-    model_path = "state-spaces/mamba-130m"
+    model_path = "model/mamba-1.4b"
+    # model_path = "state-spaces/mamba-130m"
         
     model = MambaMonitorMetal(model_path)
     prompt = "Deep learning on Mac is"
