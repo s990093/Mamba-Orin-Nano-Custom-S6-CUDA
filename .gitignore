@@ -4,8 +4,8 @@
 *.ptx
 *.cubin
 *.fatbin
-ex/
 
+ex/
 mamba/
 model/
 

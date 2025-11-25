@@ -1,27 +1,16 @@
-# -----------------------------
-# Makefile for Mamba inference
-# -----------------------------
-
-# 本地模型路徑
-MODEL_PATH=state-spaces/mamba-130m
-
-# Prompt
-PROMPT="Mamba is a sleek, shadowy creature that moves with unparalleled grace and precision, embodying both silent menace and elegant beauty, its presence commanding the attention of all who dare cross its path."
-
-# -----------------------------
-# Run Mamba inference
-# -----------------------------
 run:
-	@.venv/bin/python run_mamba2_metal_inference.py --model $(MODEL_PATH) --prompt $(PROMPT) --device "mps" --max_length 100
+	python run_mamba2_mlx.py \
+	--model model/mamba2-1.3b-hf/model.safetensors \
+	--tokenizer model/mamba2-780m/tokenizer.json \
+	--prompt "Mamba is a mysterious" \
+	--max_tokens 150 \
+	--temperature 0.8 \
+	--top_k 50 \
+	--top_p 0.92 \
+	--repetition_penalty 1.2
 
-# 另一個 target，如果你有不同 script
-run_inference:
-	@echo "Running run_inference.py with $(MODEL_PATH)..."
-	@.venv/bin/python run_inference.py --model $(MODEL_PATH) --prompt $(PROMPT)
+echo 'NEXT_PUBLIC_API_URL=http://localhost:8000' > frontend/.env.local
 
-# -----------------------------
-# Optional: clean cache / logs
-# -----------------------------
-clean:
-	@echo "Cleaning cache and temporary files..."
-	@rm -rf __pycache__ *.log *.pt *.safetensors
+
+
+uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
